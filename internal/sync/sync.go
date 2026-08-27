@@ -2,8 +2,9 @@ package sync
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"log"
+	"net/http"
 	"path"
 	"strings"
 	gosync "sync"
@@ -14,6 +15,7 @@ import (
 	"github.com/SteerSpec/strspc-sync/internal/config"
 	gh "github.com/SteerSpec/strspc-sync/internal/github"
 	"github.com/SteerSpec/strspc-sync/internal/hash"
+	sslog "github.com/SteerSpec/strspc-sync/internal/log"
 	"github.com/SteerSpec/strspc-sync/internal/registry"
 	"github.com/SteerSpec/strspc-sync/internal/state"
 	"github.com/SteerSpec/strspc-sync/internal/template"
@@ -54,12 +56,14 @@ type Options struct {
 
 // Syncer orchestrates template synchronization across repositories.
 type Syncer struct {
-	cfg      *config.SyncConfig
-	ghClient *gh.Client
-	reg      *registry.Registry
-	stateMu  gosync.Mutex
-	state    *state.DeploymentState
-	stateSHA string // SHA of the state file for updates
+	cfg          *config.SyncConfig
+	ghClient     *gh.Client
+	reg          *registry.Registry
+	centralOwner string
+	centralRepo  string
+	stateMu      gosync.Mutex
+	state        *state.DeploymentState
+	stateSHA     string // SHA of the state file for updates
 }
 
 // repoListerAdapter adapts gh.RepoService to registry.RepoLister.
@@ -85,8 +89,8 @@ func (a *repoListerAdapter) ListByOrg(ctx context.Context, org string) ([]*regis
 	return result, nil
 }
 
-func (a *repoListerAdapter) ListByTopic(ctx context.Context, topic string) ([]*registry.ResolvedRepo, error) {
-	ghRepos, err := a.repos.ListByTopic(ctx, topic)
+func (a *repoListerAdapter) ListByTopic(ctx context.Context, topic, org string) ([]*registry.ResolvedRepo, error) {
+	ghRepos, err := a.repos.ListByTopic(ctx, topic, org)
 	if err != nil {
 		return nil, err
 	}
@@ -103,13 +107,16 @@ func (a *repoListerAdapter) ListByTopic(ctx context.Context, topic string) ([]*r
 	return result, nil
 }
 
-// New creates a new Syncer.
-func New(cfg *config.SyncConfig, ghClient *gh.Client) *Syncer {
+// New creates a new Syncer. The centralOwner and centralRepo identify the
+// repository that holds templates and deployment state.
+func New(cfg *config.SyncConfig, ghClient *gh.Client, centralOwner, centralRepo string) *Syncer {
 	adapter := &repoListerAdapter{repos: ghClient.Repos}
 	return &Syncer{
-		cfg:      cfg,
-		ghClient: ghClient,
-		reg:      registry.New(adapter),
+		cfg:          cfg,
+		ghClient:     ghClient,
+		reg:          registry.New(adapter),
+		centralOwner: centralOwner,
+		centralRepo:  centralRepo,
 	}
 }
 
@@ -136,7 +143,8 @@ func (s *Syncer) Run(ctx context.Context, opts Options) (*Result, error) {
 	// Load deployment state from central repo
 	s.state, s.stateSHA, err = s.loadState(ctx)
 	if err != nil {
-		log.Printf("warning: could not load deployment state, starting fresh: %v", err)
+		sslog.L().Warn("could not load deployment state, starting fresh",
+			"operation", "sync", "err", err)
 		s.state = state.NewDeploymentState()
 	}
 
@@ -212,7 +220,8 @@ func (s *Syncer) Run(ctx context.Context, opts Options) (*Result, error) {
 	// Save state back (skip on dry run)
 	if !dryRun {
 		if err := s.saveState(ctx); err != nil {
-			log.Printf("warning: could not save deployment state: %v", err)
+			sslog.L().Warn("could not save deployment state",
+				"operation", "sync", "err", err)
 		}
 	}
 
@@ -228,9 +237,8 @@ func (s *Syncer) syncOne(ctx context.Context, target registry.ResolvedTarget, tm
 	owner, repo := splitRepo(target.Repo)
 
 	// Read template source from central repo
-	centralOwner, centralRepo := splitRepo(s.cfg.Targets.Include[0])
 	// The template source is relative to the config repo
-	templateContent, _, err := s.ghClient.Repos.GetFileContent(ctx, centralOwner, centralRepo, tmpl.Source, "")
+	templateContent, _, err := s.ghClient.Repos.GetFileContent(ctx, s.centralOwner, s.centralRepo, tmpl.Source, "")
 	if err != nil {
 		rr.Status = "error"
 		rr.Error = fmt.Sprintf("reading template source: %v", err)
@@ -279,7 +287,9 @@ func (s *Syncer) syncOne(ctx context.Context, target registry.ResolvedTarget, tm
 	}
 
 	if dryRun {
-		log.Printf("[dry-run] would sync %s to %s/%s", tmpl.ID, target.Repo, tmpl.Destination)
+		sslog.L().Info("dry-run: would sync template",
+			"operation", "sync", "dry_run", true,
+			"template_id", tmpl.ID, "repo", target.Repo, "destination", tmpl.Destination)
 		rr.Status = "skipped"
 		return rr
 	}
@@ -295,8 +305,14 @@ func (s *Syncer) syncOne(ctx context.Context, target registry.ResolvedTarget, tm
 		return rr
 	}
 
-	// Create branch (ignore error if already exists)
-	_ = s.ghClient.PullRequests.CreateBranch(ctx, owner, repo, branchName, baseSHA)
+	// Create the branch. A 422 means it already exists, which is the normal case
+	// on re-runs; anything else is a real failure and must not be swallowed —
+	// every step below would otherwise operate on a branch that does not exist.
+	if err := s.ghClient.PullRequests.CreateBranch(ctx, owner, repo, branchName, baseSHA); err != nil && !isAlreadyExists(err) {
+		rr.Status = "error"
+		rr.Error = fmt.Sprintf("creating branch: %v", err)
+		return rr
+	}
 
 	// Get the file SHA on the branch (for updates)
 	_, fileSHA, _ := s.ghClient.Repos.GetFileContent(ctx, owner, repo, tmpl.Destination, branchName)
@@ -376,12 +392,7 @@ func (s *Syncer) syncOne(ctx context.Context, target registry.ResolvedTarget, tm
 }
 
 func (s *Syncer) loadState(ctx context.Context) (*state.DeploymentState, string, error) {
-	// Determine central repo from first include pattern
-	if len(s.cfg.Targets.Include) == 0 {
-		return state.NewDeploymentState(), "", nil
-	}
-	owner, repo := splitRepo(s.cfg.Targets.Include[0])
-	data, sha, err := s.ghClient.Repos.GetFileContent(ctx, owner, repo, ".steerspec/deployment-state.json", "")
+	data, sha, err := s.ghClient.Repos.GetFileContent(ctx, s.centralOwner, s.centralRepo, ".steerspec/deployment-state.json", "")
 	if err != nil {
 		return nil, "", err
 	}
@@ -390,25 +401,25 @@ func (s *Syncer) loadState(ctx context.Context) (*state.DeploymentState, string,
 }
 
 func (s *Syncer) saveState(ctx context.Context) error {
-	if len(s.cfg.Targets.Include) == 0 {
-		return nil
-	}
-	owner, repo := splitRepo(s.cfg.Targets.Include[0])
 	data, err := s.state.Save()
 	if err != nil {
 		return fmt.Errorf("serializing state: %w", err)
 	}
-	return s.ghClient.Repos.CreateOrUpdateFile(ctx, owner, repo, ".steerspec/deployment-state.json", "", data, s.stateSHA, "[SteerSpec] Update deployment state")
+	return s.ghClient.Repos.CreateOrUpdateFile(ctx, s.centralOwner, s.centralRepo, ".steerspec/deployment-state.json", "", data, s.stateSHA, "[SteerSpec] Update deployment state")
 }
 
+// getBaseSHA resolves the branch a sync branch should be cut from to a commit
+// SHA. When no branch is known for the target, it falls back to whatever the
+// repository reports as its default.
 func (s *Syncer) getBaseSHA(ctx context.Context, owner, repo, branch string) (string, error) {
-	// Use GetFileContent on a known path to get the branch reference
-	// We use the branch name itself via GetDefaultBranch
-	sha, err := s.ghClient.Repos.GetDefaultBranch(ctx, owner, repo)
-	if err != nil {
-		return "", err
+	if branch == "" {
+		var err error
+		branch, err = s.ghClient.Repos.GetDefaultBranch(ctx, owner, repo)
+		if err != nil {
+			return "", fmt.Errorf("resolving default branch: %w", err)
+		}
 	}
-	return sha, nil
+	return s.ghClient.Repos.GetBranchSHA(ctx, owner, repo, branch)
 }
 
 func (s *Syncer) closeStalePRs(ctx context.Context, owner, repo, templateID string, currentPR int, label string) {
@@ -464,6 +475,23 @@ func shouldApplyTemplate(target registry.ResolvedTarget, templateID string) bool
 		}
 	}
 	return true
+}
+
+// isAlreadyExists reports whether err is the GitHub API's "Reference already
+// exists" response. Branch creation is idempotent from the caller's point of
+// view: on every run after the first, the sync branch is already there.
+//
+// The status alone is not enough to decide that. git/refs answers 422 for any
+// validation failure — an invalid ref name, or a base SHA that does not resolve
+// — and tolerating those would put us back where GH #31 started, with later
+// steps running against a branch that was never created. So the message has to
+// match as well.
+func isAlreadyExists(err error) bool {
+	var apiErr *gh.APIError
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusUnprocessableEntity {
+		return false
+	}
+	return strings.Contains(strings.ToLower(apiErr.Message), "already exists")
 }
 
 func splitRepo(fullName string) (owner, repo string) {

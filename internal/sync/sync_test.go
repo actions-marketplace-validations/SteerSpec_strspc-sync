@@ -3,6 +3,7 @@ package sync
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"strings"
 	gosync "sync"
 	"sync/atomic"
@@ -22,6 +23,7 @@ type mockRepoService struct {
 	fileSHAs      map[string]string           // "owner/repo/path/ref" -> sha
 	defaultBranch string
 	createdFiles  []string
+	branchSHAErr  error
 }
 
 func newMockRepoService() *mockRepoService {
@@ -37,11 +39,18 @@ func (m *mockRepoService) ListByOrg(_ context.Context, org string) ([]*gh.Reposi
 	return m.repos[org], nil
 }
 
-func (m *mockRepoService) ListByTopic(_ context.Context, topic string) ([]*gh.Repository, error) {
+func (m *mockRepoService) ListByTopic(_ context.Context, topic, _ string) ([]*gh.Repository, error) {
 	return m.repos["topic:"+topic], nil
 }
 
 func (m *mockRepoService) GetDefaultBranch(_ context.Context, _, _ string) (string, error) {
+	return m.defaultBranch, nil
+}
+
+func (m *mockRepoService) GetBranchSHA(_ context.Context, _, _, _ string) (string, error) {
+	if m.branchSHAErr != nil {
+		return "", m.branchSHAErr
+	}
 	return "abc123sha", nil
 }
 
@@ -79,6 +88,11 @@ type mockPRService struct {
 	closed   []int
 	nextPR   int
 	branches []string
+	// branchBases records the baseSHA each branch was cut from.
+	branchBases []string
+
+	// createBranchErr, when set, is returned by CreateBranch instead of nil.
+	createBranchErr error
 }
 
 func newMockPRService() *mockPRService {
@@ -137,10 +151,14 @@ func (m *mockPRService) Close(_ context.Context, _, _ string, number int) error 
 	return nil
 }
 
-func (m *mockPRService) CreateBranch(_ context.Context, _, _, branch, _ string) error {
+func (m *mockPRService) CreateBranch(_ context.Context, _, _, branch, baseSHA string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.createBranchErr != nil {
+		return m.createBranchErr
+	}
 	m.branches = append(m.branches, branch)
+	m.branchBases = append(m.branchBases, baseSHA)
 	return nil
 }
 
@@ -185,8 +203,8 @@ func setupMockRepos(repoSvc *mockRepoService) {
 		{Owner: "testorg", Name: "repo-a", FullName: "testorg/repo-a", DefaultBranch: "main"},
 		{Owner: "testorg", Name: "repo-b", FullName: "testorg/repo-b", DefaultBranch: "main"},
 	}
-	// Template source file
-	repoSvc.files["testorg/*/templates/CLAUDE.md/"] = []byte("# Hello {{org_name}}")
+	// Template source file in central repo
+	repoSvc.files["testorg/central/templates/CLAUDE.md/"] = []byte("# Hello {{org_name}}")
 	// State file (empty/missing is fine)
 }
 
@@ -198,7 +216,7 @@ func TestRunBasic(t *testing.T) {
 	cfg := makeTestConfig()
 	client := makeTestClient(repoSvc, prSvc)
 
-	syncer := New(cfg, client)
+	syncer := New(cfg, client, "testorg", "central")
 	result, err := syncer.Run(context.Background(), Options{Trigger: "manual"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -223,7 +241,7 @@ func TestDryRun(t *testing.T) {
 	cfg := makeTestConfig()
 	client := makeTestClient(repoSvc, prSvc)
 
-	syncer := New(cfg, client)
+	syncer := New(cfg, client, "testorg", "central")
 	result, err := syncer.Run(context.Background(), Options{
 		DryRun:  true,
 		Trigger: "manual",
@@ -248,7 +266,7 @@ func TestTargetFilter(t *testing.T) {
 	cfg := makeTestConfig()
 	client := makeTestClient(repoSvc, prSvc)
 
-	syncer := New(cfg, client)
+	syncer := New(cfg, client, "testorg", "central")
 	result, err := syncer.Run(context.Background(), Options{
 		TargetFilter: "testorg/repo-a",
 		Trigger:      "manual",
@@ -277,11 +295,11 @@ func TestTemplateFilter(t *testing.T) {
 		Strategy:    "full-replace",
 	})
 	// Add source for second template
-	repoSvc.files["testorg/*/templates/review.md/"] = []byte("review content")
+	repoSvc.files["testorg/central/templates/review.md/"] = []byte("review content")
 
 	client := makeTestClient(repoSvc, prSvc)
 
-	syncer := New(cfg, client)
+	syncer := New(cfg, client, "testorg", "central")
 	result, err := syncer.Run(context.Background(), Options{
 		TemplateFilter: "claude-md",
 		Trigger:        "manual",
@@ -304,7 +322,7 @@ func TestForceBypassesHashCheck(t *testing.T) {
 	cfg := makeTestConfig()
 	client := makeTestClient(repoSvc, prSvc)
 
-	syncer := New(cfg, client)
+	syncer := New(cfg, client, "testorg", "central")
 
 	// First run to populate state
 	_, err := syncer.Run(context.Background(), Options{Trigger: "manual"})
@@ -329,7 +347,7 @@ func TestForceBypassesHashCheck(t *testing.T) {
 	prSvc2 := newMockPRService()
 	// Copy existing PRs so they can be found
 	client2 := makeTestClient(repoSvc, prSvc2)
-	syncer2 := New(cfg, client2)
+	syncer2 := New(cfg, client2, "testorg", "central")
 	syncer2.state = syncer.state // carry over state
 
 	result3, err := syncer2.Run(context.Background(), Options{Force: true, Trigger: "manual"})
@@ -354,7 +372,7 @@ func TestPerRepoErrorIsolation(t *testing.T) {
 		{Owner: "testorg", Name: "repo-fail", FullName: "testorg/repo-fail", DefaultBranch: "main"},
 	}
 	// Only provide template source (both repos try to read from central, which uses first include pattern)
-	repoSvc.files["testorg/*/templates/CLAUDE.md/"] = []byte("content")
+	repoSvc.files["testorg/central/templates/CLAUDE.md/"] = []byte("content")
 
 	// Make PR creation fail for repo-fail
 	failPRSvc := &failingPRService{
@@ -368,7 +386,7 @@ func TestPerRepoErrorIsolation(t *testing.T) {
 		PullRequests: failPRSvc,
 	}
 
-	syncer := New(cfg, client)
+	syncer := New(cfg, client, "testorg", "central")
 	result, err := syncer.Run(context.Background(), Options{Trigger: "manual"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -424,7 +442,7 @@ func TestConcurrencyLimiting(t *testing.T) {
 		})
 	}
 	repoSvc.repos["testorg"] = repos
-	repoSvc.files["testorg/*/templates/CLAUDE.md/"] = []byte("content")
+	repoSvc.files["testorg/central/templates/CLAUDE.md/"] = []byte("content")
 
 	var maxConcurrent int64
 	var current int64
@@ -452,7 +470,7 @@ func TestConcurrencyLimiting(t *testing.T) {
 		PullRequests: slowPR,
 	}
 
-	syncer := New(cfg, client)
+	syncer := New(cfg, client, "testorg", "central")
 	_, err := syncer.Run(context.Background(), Options{Trigger: "manual"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -550,7 +568,7 @@ func TestPRTitleFormat(t *testing.T) {
 	cfg := makeTestConfig()
 	client := makeTestClient(repoSvc, prSvc)
 
-	syncer := New(cfg, client)
+	syncer := New(cfg, client, "testorg", "central")
 	_, err := syncer.Run(context.Background(), Options{Trigger: "push"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -585,7 +603,7 @@ func TestSYNCPR002_BranchNameFormat(t *testing.T) {
 	cfg := makeTestConfig()
 	client := makeTestClient(repoSvc, prSvc)
 
-	syncer := New(cfg, client)
+	syncer := New(cfg, client, "testorg", "central")
 	_, err := syncer.Run(context.Background(), Options{Trigger: "push"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -607,7 +625,7 @@ func TestSYNCPR005_NoDuplicatePRs(t *testing.T) {
 	repoSvc.repos["testorg"] = []*gh.Repository{
 		{Owner: "testorg", Name: "repo-a", FullName: "testorg/repo-a", DefaultBranch: "main"},
 	}
-	repoSvc.files["testorg/*/templates/CLAUDE.md/"] = []byte("# Hello {{org_name}}")
+	repoSvc.files["testorg/central/templates/CLAUDE.md/"] = []byte("# Hello {{org_name}}")
 
 	// Pre-populate an open PR matching the template
 	basePR.prs["testorg/repo-a"] = []*gh.PullRequest{
@@ -628,7 +646,7 @@ func TestSYNCPR005_NoDuplicatePRs(t *testing.T) {
 		PullRequests: prSvc,
 	}
 
-	syncer := New(cfg, client)
+	syncer := New(cfg, client, "testorg", "central")
 	result, err := syncer.Run(context.Background(), Options{Trigger: "manual", Force: true})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -655,7 +673,7 @@ func TestSYNCPR006_CloseStalePRs(t *testing.T) {
 	repoSvc.repos["testorg"] = []*gh.Repository{
 		{Owner: "testorg", Name: "repo-a", FullName: "testorg/repo-a", DefaultBranch: "main"},
 	}
-	repoSvc.files["testorg/*/templates/CLAUDE.md/"] = []byte("# Hello {{org_name}}")
+	repoSvc.files["testorg/central/templates/CLAUDE.md/"] = []byte("# Hello {{org_name}}")
 
 	// Pre-populate 2 old stale PRs with matching title prefix and label
 	prSvc.prs["testorg/repo-a"] = []*gh.PullRequest{
@@ -678,7 +696,7 @@ func TestSYNCPR006_CloseStalePRs(t *testing.T) {
 	cfg := makeTestConfig()
 	client := makeTestClient(repoSvc, prSvc)
 
-	syncer := New(cfg, client)
+	syncer := New(cfg, client, "testorg", "central")
 	result, err := syncer.Run(context.Background(), Options{Trigger: "manual"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -702,7 +720,7 @@ func TestSYNCACT_ResultCounts(t *testing.T) {
 		{Owner: "testorg", Name: "repo-insync", FullName: "testorg/repo-insync", DefaultBranch: "main"},
 		{Owner: "testorg", Name: "repo-fail", FullName: "testorg/repo-fail", DefaultBranch: "main"},
 	}
-	repoSvc.files["testorg/*/templates/CLAUDE.md/"] = []byte("content")
+	repoSvc.files["testorg/central/templates/CLAUDE.md/"] = []byte("content")
 
 	failPR := &failingPRService{
 		inner:    newMockPRService(),
@@ -715,7 +733,7 @@ func TestSYNCACT_ResultCounts(t *testing.T) {
 		PullRequests: failPR,
 	}
 
-	syncer := New(cfg, client)
+	syncer := New(cfg, client, "testorg", "central")
 
 	// First run: creates PRs for repo-new and repo-fail (fails)
 	result, err := syncer.Run(context.Background(), Options{Trigger: "manual"})
@@ -749,7 +767,7 @@ func TestDryRunDoesNotSaveState(t *testing.T) {
 	cfg := makeTestConfig()
 	client := makeTestClient(repoSvc, prSvc)
 
-	syncer := New(cfg, client)
+	syncer := New(cfg, client, "testorg", "central")
 	_, err := syncer.Run(context.Background(), Options{
 		DryRun:  true,
 		Trigger: "manual",
@@ -763,5 +781,165 @@ func TestDryRunDoesNotSaveState(t *testing.T) {
 		if strings.Contains(path, "deployment-state.json") {
 			t.Errorf("SYNCOP-007: dry run should not save state, but CreateOrUpdateFile was called for %s", path)
 		}
+	}
+}
+
+// The branch is cut from the SHA GetBranchSHA resolves, not from the branch
+// name — passing a name here is what GH #31 was about, and the git/refs
+// endpoint rejects it with a 422.
+func TestCreateBranchUsesResolvedSHA(t *testing.T) {
+	repoSvc := newMockRepoService()
+	prSvc := newMockPRService()
+	setupMockRepos(repoSvc)
+
+	syncer := New(makeTestConfig(), makeTestClient(repoSvc, prSvc), "testorg", "central")
+	if _, err := syncer.Run(context.Background(), Options{Trigger: "manual"}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(prSvc.branchBases) == 0 {
+		t.Fatal("expected at least one branch to be created")
+	}
+	for _, base := range prSvc.branchBases {
+		if base != "abc123sha" {
+			t.Errorf("expected branch cut from resolved sha abc123sha, got %q", base)
+		}
+	}
+}
+
+// Re-running a sync hits an existing branch. That 422 is the normal case and
+// must not fail the run.
+func TestCreateBranchAlreadyExistsIsTolerated(t *testing.T) {
+	repoSvc := newMockRepoService()
+	prSvc := newMockPRService()
+	prSvc.createBranchErr = &gh.APIError{
+		StatusCode: http.StatusUnprocessableEntity,
+		Message:    "Reference already exists",
+	}
+	setupMockRepos(repoSvc)
+
+	syncer := New(makeTestConfig(), makeTestClient(repoSvc, prSvc), "testorg", "central")
+	result, err := syncer.Run(context.Background(), Options{Trigger: "manual"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if result.Errors != 0 {
+		t.Errorf("expected 0 errors for an existing branch, got %d: %+v", result.Errors, result.RepoResults)
+	}
+	if result.PRsCreated != 2 {
+		t.Errorf("expected sync to continue and create 2 PRs, got %d", result.PRsCreated)
+	}
+}
+
+// Any other branch-creation failure must surface. Previously the error was
+// discarded, so the file write and PR steps ran against a branch that did not
+// exist.
+func TestCreateBranchHardFailureIsReported(t *testing.T) {
+	repoSvc := newMockRepoService()
+	prSvc := newMockPRService()
+	prSvc.createBranchErr = &gh.APIError{
+		StatusCode: http.StatusInternalServerError,
+		Message:    "Internal Server Error",
+	}
+	setupMockRepos(repoSvc)
+
+	syncer := New(makeTestConfig(), makeTestClient(repoSvc, prSvc), "testorg", "central")
+	result, err := syncer.Run(context.Background(), Options{Trigger: "manual"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if result.Errors != 2 {
+		t.Errorf("expected 2 errors, got %d", result.Errors)
+	}
+	if len(prSvc.created) != 0 {
+		t.Errorf("expected no PRs after branch creation failed, got %d", len(prSvc.created))
+	}
+	for _, rr := range result.RepoResults {
+		if !strings.Contains(rr.Error, "creating branch") {
+			t.Errorf("expected a branch-creation error, got %q", rr.Error)
+		}
+	}
+}
+
+func TestBaseSHAResolutionFailureIsReported(t *testing.T) {
+	repoSvc := newMockRepoService()
+	repoSvc.branchSHAErr = &gh.APIError{StatusCode: http.StatusNotFound, Message: "Not Found"}
+	prSvc := newMockPRService()
+	setupMockRepos(repoSvc)
+
+	syncer := New(makeTestConfig(), makeTestClient(repoSvc, prSvc), "testorg", "central")
+	result, err := syncer.Run(context.Background(), Options{Trigger: "manual"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if result.Errors != 2 {
+		t.Errorf("expected 2 errors, got %d", result.Errors)
+	}
+	for _, rr := range result.RepoResults {
+		if !strings.Contains(rr.Error, "getting base SHA") {
+			t.Errorf("expected a base-SHA error, got %q", rr.Error)
+		}
+	}
+}
+
+// git/refs answers 422 for any validation failure, not just an existing ref —
+// an unresolvable base SHA lands here too. Tolerating those on status alone
+// would put us back at GH #31, with later steps running against a branch that
+// was never created.
+func TestCreateBranch422OtherThanAlreadyExistsIsReported(t *testing.T) {
+	for _, message := range []string{
+		"Object does not exist",
+		"Reference cannot be created",
+	} {
+		t.Run(message, func(t *testing.T) {
+			repoSvc := newMockRepoService()
+			prSvc := newMockPRService()
+			prSvc.createBranchErr = &gh.APIError{
+				StatusCode: http.StatusUnprocessableEntity,
+				Message:    message,
+			}
+			setupMockRepos(repoSvc)
+
+			syncer := New(makeTestConfig(), makeTestClient(repoSvc, prSvc), "testorg", "central")
+			result, err := syncer.Run(context.Background(), Options{Trigger: "manual"})
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			if result.Errors != 2 {
+				t.Errorf("expected 2 errors for a non-existence 422, got %d", result.Errors)
+			}
+			if len(prSvc.created) != 0 {
+				t.Errorf("expected no PRs after branch creation failed, got %d", len(prSvc.created))
+			}
+		})
+	}
+}
+
+func TestIsAlreadyExists(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"reference already exists", &gh.APIError{StatusCode: 422, Message: "Reference already exists"}, true},
+		{"lowercase message", &gh.APIError{StatusCode: 422, Message: "reference already exists"}, true},
+		{"wrapped", fmt.Errorf("create branch: %w", &gh.APIError{StatusCode: 422, Message: "Reference already exists"}), true},
+		{"422 invalid sha", &gh.APIError{StatusCode: 422, Message: "Object does not exist"}, false},
+		{"422 empty message", &gh.APIError{StatusCode: 422}, false},
+		{"404", &gh.APIError{StatusCode: 404, Message: "Not Found"}, false},
+		{"non-api error", fmt.Errorf("network unreachable"), false},
+		{"nil", nil, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isAlreadyExists(tt.err); got != tt.want {
+				t.Errorf("isAlreadyExists(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
 	}
 }
