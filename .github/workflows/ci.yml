@@ -10,13 +10,33 @@ permissions:
   contents: read
 
 jobs:
+  # Dogfood: the released CLI validates this repository's realm (rules/,
+  # dev.steerspec.sync) and evaluates the change through the org reusable
+  # workflows (SteerSpec/.github). Without ANTHROPIC_API_KEY the check is
+  # static-only.
+  rules:
+    uses: SteerSpec/.github/.github/workflows/strspc-lint.yml@main
+    permissions:
+      contents: read
+      pull-requests: read
+    with:
+      path: rules/
+
+  check:
+    uses: SteerSpec/.github/.github/workflows/strspc-check.yml@main
+    permissions:
+      contents: read
+      pull-requests: read
+    secrets:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+
   test:
     runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
       - run: go vet ./...
@@ -56,7 +76,7 @@ jobs:
             printf "Coverage %s%% meets the %s%% threshold\n", c, t
           }'
       - name: Upload coverage profile
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: coverage
           path: coverage.out
@@ -64,18 +84,22 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
-      - uses: golangci/golangci-lint-action@v7
+      - uses: golangci/golangci-lint-action@v9
         with:
-          version: v2.11.2
+          version: v2.15.0
+          # `config verify` downloads the JSON schema from golangci-lint.run on
+          # every run and has timed out repeatedly; the pre-commit golangci-lint
+          # hook (.pre-commit-config.yaml) still verifies the config locally.
+          verify: false
 
   lint-extra:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: actionlint
         uses: raven-actions/actionlint@v2
       - name: shellcheck
@@ -88,11 +112,12 @@ jobs:
         with:
           config_file: .yamllint.yml
       - name: markdownlint
-        uses: DavidAnson/markdownlint-cli2-action@v16
+        uses: DavidAnson/markdownlint-cli2-action@v25
         with:
           config: .markdownlint.yml
           globs: |
             **/*.md
             !node_modules/**
+            !CHANGELOG.md
       - name: editorconfig-checker
         uses: editorconfig-checker/action-editorconfig-checker@v2

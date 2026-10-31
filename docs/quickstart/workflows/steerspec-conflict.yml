@@ -8,9 +8,10 @@ jobs:
   conflict:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: SteerSpec/strspc-sync/conflict@v0.2.0
+      - uses: actions/checkout@v7
+      - uses: SteerSpec/strspc-sync/conflict@v0.3.0
         with:
           tiers: '1,2'
-        env:
-          GITHUB_TOKEN: ${{ secrets.STEERSPEC_TOKEN }}
+          # Must be able to read target repos; the default workflow token only
+          # reaches the current repository.
+          token: ${{ secrets.STEERSPEC_TOKEN }}

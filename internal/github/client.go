@@ -30,6 +30,9 @@ type RepoService interface {
 	GetBranchSHA(ctx context.Context, owner, repo, branch string) (string, error)
 	GetFileContent(ctx context.Context, owner, repo, path, ref string) ([]byte, string, error) // content, sha, error
 	CreateOrUpdateFile(ctx context.Context, owner, repo, path, branch string, content []byte, sha, message string) error
+	// IsSymlink reports whether path is a symlink at ref. GetFileContent cannot tell: the Contents API follows
+	// a working in-repo link and returns the target's content as a regular file.
+	IsSymlink(ctx context.Context, owner, repo, path, ref string) (bool, error)
 }
 
 // PullRequestService provides access to pull-request-related GitHub API endpoints.
@@ -39,6 +42,8 @@ type PullRequestService interface {
 	Update(ctx context.Context, owner, repo string, number int, pr *PullRequestUpdate) error
 	Close(ctx context.Context, owner, repo string, number int) error
 	CreateBranch(ctx context.Context, owner, repo, branch, baseSHA string) error
+	// Get fetches one pull request, including whether it was merged.
+	Get(ctx context.Context, owner, repo string, number int) (*PullRequest, error)
 }
 
 // IssueService provides access to issue-related GitHub API endpoints.
@@ -56,6 +61,7 @@ type Repository struct {
 	DefaultBranch string
 	Topics        []string
 	Archived      bool
+	Visibility    string // "public", "internal" or "private"
 }
 
 type PullRequest struct {
@@ -67,6 +73,9 @@ type PullRequest struct {
 	Base   string
 	Labels []string
 	URL    string
+	// Merged is true for a closed pull request that was merged rather
+	// than closed unmerged.
+	Merged bool
 }
 
 type PullRequestCreate struct {

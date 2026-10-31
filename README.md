@@ -11,7 +11,7 @@
 <!-- markdownlint-enable MD013 -->
 
 Synchronize AI configuration files (`CLAUDE.md`, `.claude/agents/`, `.claude/skills/`,
-`.claude/settings/`) across your GitHub organization. Define templates once in a central
+`.claude/settings.json`) across your GitHub organization. Define templates once in a central
 repo, then distribute them via pull requests.
 
 ---
@@ -41,8 +41,10 @@ flowchart LR
 ```
 
 Nothing is force-pushed and nothing is merged for you: every change lands as a reviewable PR in the
-target repo. Two companion commands watch what happens afterwards — `monitor` reports files that
-have drifted away from their template, and `conflict` flags contradictions across the fleet.
+target repo, titled `chore(steerspec-sync): update <template-id> to <version>` (the type and
+scope are configurable) so commitlint and semantic-PR checks let it through. Two companion
+commands watch what happens afterwards — `monitor` reports files that have drifted away from their
+template, and `conflict` flags contradictions across the fleet.
 
 ## Quick Start
 
@@ -63,13 +65,17 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: SteerSpec/strspc-sync/sync@v0.2.0
+      - uses: actions/checkout@v7
+      - uses: SteerSpec/strspc-sync/sync@v0.3.0
         with:
           dry-run: false
-        env:
-          GITHUB_TOKEN: ${{ secrets.STEERSPEC_TOKEN }}
+          token: ${{ secrets.STEERSPEC_TOKEN }}
 ```
+
+The `token` input defaults to the workflow's own `GITHUB_TOKEN`, which is scoped to the
+repository running the workflow and cannot open pull requests anywhere else — so pass a
+PAT (or a GitHub App installation token) with `contents` and `pull_requests` write access on
+every target repo. For `auth.method: github-app`, pass `app-id` and `private-key` instead.
 
 ## Installation
 
@@ -79,15 +85,37 @@ Use the composite actions directly from the Marketplace:
 
 ```yaml
 # Full action (specify command)
-- uses: SteerSpec/strspc-sync@v0.2.0
+- uses: SteerSpec/strspc-sync@v0.3.0
   with:
     command: sync
 
 # Convenience sub-actions
-- uses: SteerSpec/strspc-sync/sync@v0.2.0
-- uses: SteerSpec/strspc-sync/monitor@v0.2.0
-- uses: SteerSpec/strspc-sync/conflict@v0.2.0
+- uses: SteerSpec/strspc-sync/sync@v0.3.0
+- uses: SteerSpec/strspc-sync/monitor@v0.3.0
+- uses: SteerSpec/strspc-sync/conflict@v0.3.0
 ```
+
+#### Keeping the pin current
+
+Pin an exact tag, never a branch: the action downloads the binary named by the `VERSION` file at that tag, and a
+sync run opens or updates pull requests in the target repositories whose rendered content changed. Nothing moves
+an exact pin for you, so let Dependabot open a pull request for each new release:
+
+```yaml
+# .github/dependabot.yml
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+```
+
+Read the release notes before merging a bump. Sync, monitor and conflict workflows pinned in the same repository
+are updated together by the `groups` entry.
 
 ### CLI Binary
 
@@ -115,7 +143,7 @@ strspc sync --config steerspec-sync.yml --template-filter claude-md --force
 **Action usage:**
 
 ```yaml
-- uses: SteerSpec/strspc-sync/sync@v0.2.0
+- uses: SteerSpec/strspc-sync/sync@v0.3.0
   with:
     dry-run: true
     target-filter: 'my-org/api-*'
@@ -134,7 +162,7 @@ strspc monitor --config steerspec-sync.yml
 **Action usage:**
 
 ```yaml
-- uses: SteerSpec/strspc-sync/monitor@v0.2.0
+- uses: SteerSpec/strspc-sync/monitor@v0.3.0
 ```
 
 **Outputs:** `repos-in-sync`, `repos-drifted`, `issues-created`, `issues-closed`, `summary`
@@ -151,7 +179,7 @@ strspc conflict --config steerspec-sync.yml --tiers 1,2
 **Action usage:**
 
 ```yaml
-- uses: SteerSpec/strspc-sync/conflict@v0.2.0
+- uses: SteerSpec/strspc-sync/conflict@v0.3.0
   with:
     tiers: '1,2'
 ```
@@ -162,8 +190,7 @@ strspc conflict --config steerspec-sync.yml --tiers 1,2
 
 All configuration lives in `steerspec-sync.yml`.
 See [docs/quickstart/steerspec-sync.yml](docs/quickstart/steerspec-sync.yml) for an example
-and the [full specification](https://github.com/SteerSpec/strspc-spec/blob/main/rules/config/CONFIG.md)
-for the schema reference.
+and the `SYNCCFG` entity in [`rules/`](rules/SYNCCFG.json) for the specification of every key.
 
 ## Contributing
 
@@ -189,7 +216,13 @@ Part of the [SteerSpec](https://steerspec.dev) ecosystem:
 
 ## Specification
 
-This tool implements the [SteerSpec Sync specification](https://github.com/SteerSpec/strspc-spec).
+The SteerSpec Sync specification is the `dev.steerspec.sync` realm in [`rules/`](rules/):
+166 rules across 11 entities (configuration, manifest, templates, sync, monitor and conflict
+actions, deployment state, component registry, versioning), depending on
+[`dev.steerspec.core`](https://github.com/SteerSpec/strspc-rules). Rules are authored with the
+[`strspc` CLI](https://github.com/SteerSpec/strspc-CLI) (`strspc rule add`, `strspc rule promote`)
+and validated in CI (`strspc realm validate`, `strspc lint`, `strspc diff`); every pull request is
+also evaluated against them by `strspc check`.
 
 ## License
 

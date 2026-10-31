@@ -5,11 +5,16 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 )
+
+// ErrSymlink is returned by GetFileContent when the path is a symlink.
+var ErrSymlink = errors.New("path is a symlink")
 
 type repoService struct {
 	client *Client
@@ -145,12 +150,18 @@ func (s *repoService) GetFileContent(ctx context.Context, owner, repo, path, ref
 	}
 
 	var content struct {
+		Type     string `json:"type"`
 		Content  string `json:"content"`
 		SHA      string `json:"sha"`
 		Encoding string `json:"encoding"`
 	}
 	if err := decodeBody(resp, &content); err != nil {
 		return nil, "", err
+	}
+	// A symlink has no content, only a target path. Writing to it through the
+	// Contents API stores the new bytes as the target (GH #82).
+	if content.Type == "symlink" {
+		return nil, content.SHA, fmt.Errorf("get file %s/%s/%s: %w", owner, repo, path, ErrSymlink)
 	}
 
 	decoded, err := base64.StdEncoding.DecodeString(content.Content)
@@ -160,13 +171,68 @@ func (s *repoService) GetFileContent(ctx context.Context, owner, repo, path, ref
 	return decoded, content.SHA, nil
 }
 
+// IsSymlink reads the git tree of the parent directory and checks the entry's mode (120000 is a symlink).
+// Neither Contents API response shows it: a single-file GET follows a working link and returns the target as a
+// regular file, and the directory listing reports the link itself with type "file". A missing directory or
+// entry is not a symlink; a truncated tree cannot decide, so it is an error.
+func (s *repoService) IsSymlink(ctx context.Context, owner, repo, path, ref string) (bool, error) {
+	dir, name := "", path
+	if i := strings.LastIndex(path, "/"); i >= 0 {
+		dir, name = path[:i], path[i+1:]
+	}
+	if ref == "" {
+		ref = "HEAD"
+	}
+	treeish := ref
+	if dir != "" {
+		treeish += ":" + dir
+	}
+	u := fmt.Sprintf("%s/repos/%s/%s/git/trees/%s", s.client.baseURL, url.PathEscape(owner), url.PathEscape(repo), url.PathEscape(treeish))
+	resp, err := s.client.doRequest(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return false, err
+	}
+	if resp.StatusCode == http.StatusNotFound {
+		resp.Body.Close() //nolint:errcheck // not-found body close is best-effort
+		return false, nil
+	}
+	if err := checkResponse(resp); err != nil {
+		return false, fmt.Errorf("read tree %s/%s@%s: %w", owner, repo, treeish, err)
+	}
+	var tree struct {
+		Tree []struct {
+			Path string `json:"path"`
+			Mode string `json:"mode"`
+		} `json:"tree"`
+		Truncated bool `json:"truncated"`
+	}
+	if err := decodeBody(resp, &tree); err != nil {
+		return false, err
+	}
+	for _, e := range tree.Tree {
+		if e.Path == name {
+			return e.Mode == "120000", nil
+		}
+	}
+	if tree.Truncated {
+		return false, fmt.Errorf("tree %s/%s@%s is truncated: cannot tell whether %s is a symlink", owner, repo, treeish, path)
+	}
+	return false, nil
+}
+
 func (s *repoService) CreateOrUpdateFile(ctx context.Context, owner, repo, path, branch string, content []byte, sha, message string) error {
 	u := fmt.Sprintf("%s/repos/%s/%s/contents/%s", s.client.baseURL, url.PathEscape(owner), url.PathEscape(repo), path)
 
 	body := map[string]string{
 		"message": message,
 		"content": base64.StdEncoding.EncodeToString(content),
-		"branch":  branch,
+	}
+	// Only send "branch" when we actually have one. GitHub does not fall back to
+	// the repository default when the key is present but empty — it answers
+	// 404 "Branch  not found", which is how deployment state silently went
+	// unwritten for months (GH #43). Omitting the key selects the default branch.
+	if branch != "" {
+		body["branch"] = branch
 	}
 	if sha != "" {
 		body["sha"] = sha
@@ -195,6 +261,8 @@ type apiRepo struct {
 	DefaultBranch string                 `json:"default_branch"`
 	Topics        []string               `json:"topics"`
 	Archived      bool                   `json:"archived"`
+	Private       bool                   `json:"private"`
+	Visibility    string                 `json:"visibility"`
 }
 
 func (r *apiRepo) toDomain() *Repository {
@@ -205,7 +273,20 @@ func (r *apiRepo) toDomain() *Repository {
 		DefaultBranch: r.DefaultBranch,
 		Topics:        r.Topics,
 		Archived:      r.Archived,
+		Visibility:    r.visibility(),
 	}
+}
+
+// visibility returns "public", "internal" or "private". The API's visibility
+// field wins; the private flag covers responses that omit it.
+func (r *apiRepo) visibility() string {
+	if r.Visibility != "" {
+		return r.Visibility
+	}
+	if r.Private {
+		return "private"
+	}
+	return "public"
 }
 
 func decodeBody(resp *http.Response, v any) error {

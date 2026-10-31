@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -545,6 +546,82 @@ func TestRepoGetFileContent(t *testing.T) {
 	}
 }
 
+func TestRepoGetFileContentSymlink(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/repos/o/r/contents/CLAUDE.md", func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]string{ //nolint:errcheck // test handler write
+			"type":   "symlink",
+			"sha":    "abc123",
+			"target": "AGENTS.md",
+		})
+	})
+
+	c := testClient(t, mux)
+	_, _, err := c.Repos.GetFileContent(context.Background(), "o", "r", "CLAUDE.md", "main")
+	if !errors.Is(err, ErrSymlink) {
+		t.Fatalf("expected ErrSymlink, got %v", err)
+	}
+}
+
+func TestRepoIsSymlink(t *testing.T) {
+	mux := http.NewServeMux()
+	// Shapes copied from the real API (strspc-pr-review): the Contents API reports CLAUDE.md as a regular file
+	// both when fetched (the target's content) and in a directory listing, while the git tree carries mode 120000.
+	mux.HandleFunc("/repos/o/r/contents/CLAUDE.md", func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{"type": "file", "size": 5956}) //nolint:errcheck // test handler write
+	})
+	mux.HandleFunc("/repos/o/r/git/trees/main", func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck // test handler write
+			"truncated": false,
+			"tree": []map[string]string{
+				{"path": "AGENTS.md", "mode": "100644"},
+				{"path": "CLAUDE.md", "mode": "120000"},
+			},
+		})
+	})
+	mux.HandleFunc("/repos/o/r/git/trees/main:docs", func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck // test handler write
+			"truncated": false,
+			"tree": []map[string]string{
+				{"path": "guide.md", "mode": "100644"},
+				{"path": "link.md", "mode": "120000"},
+			},
+		})
+	})
+	mux.HandleFunc("/repos/o/r/git/trees/main:nodir", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		fmt.Fprint(w, `{"message":"Not Found"}`) //nolint:errcheck // test handler write
+	})
+	mux.HandleFunc("/repos/o/r/git/trees/main:big", func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{"truncated": true, "tree": []map[string]string{}}) //nolint:errcheck // test handler write
+	})
+	c := testClient(t, mux)
+
+	if _, err := c.Repos.IsSymlink(context.Background(), "o", "r", "big/file.md", "main"); err == nil {
+		t.Error("a truncated tree cannot decide and must be an error")
+	}
+
+	for _, tc := range []struct {
+		path string
+		want bool
+	}{
+		{"CLAUDE.md", true},
+		{"AGENTS.md", false},
+		{"missing.md", false},
+		{"docs/link.md", true},
+		{"docs/guide.md", false},
+		{"nodir/file.md", false},
+	} {
+		got, err := c.Repos.IsSymlink(context.Background(), "o", "r", tc.path, "main")
+		if err != nil {
+			t.Fatalf("%s: %v", tc.path, err)
+		}
+		if got != tc.want {
+			t.Errorf("%s: got %v, want %v", tc.path, got, tc.want)
+		}
+	}
+}
+
 func TestRepoCreateOrUpdateFile(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/repos/o/r/contents/file.txt", func(w http.ResponseWriter, r *http.Request) {
@@ -593,6 +670,62 @@ func TestPRCreate(t *testing.T) {
 	}
 	if pr.Number != 42 {
 		t.Fatalf("expected PR #42, got #%d", pr.Number)
+	}
+}
+
+// GitHub ignores a head filter without the "owner:" prefix and returns every PR.
+func TestPRListQualifiesHead(t *testing.T) {
+	tests := []struct {
+		name, head, want string
+	}{
+		{"bare branch", "steerspec-sync/claude-md/1.0.0", "o:steerspec-sync/claude-md/1.0.0"},
+		{"already qualified", "fork:feature", "fork:feature"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var got string
+			mux := http.NewServeMux()
+			mux.HandleFunc("/repos/o/r/pulls", func(w http.ResponseWriter, r *http.Request) {
+				got = r.URL.Query().Get("head")
+				w.WriteHeader(http.StatusOK)
+				w.Write([]byte("[]")) //nolint:errcheck // test handler write
+			})
+			c := testClient(t, mux)
+			if _, err := c.PullRequests.List(context.Background(), "o", "r", &PullRequestListOptions{Head: tt.head}); err != nil {
+				t.Fatal(err)
+			}
+			if got != tt.want {
+				t.Errorf("head query = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestPRCreateLabelFailure(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/repos/o/r/pulls", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+		json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck // test handler write
+			"number": 42,
+			"state":  "open",
+			"head":   map[string]string{"ref": "feature"},
+			"base":   map[string]string{"ref": "main"},
+		})
+	})
+	mux.HandleFunc("/repos/o/r/issues/42/labels", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		w.Write([]byte(`{"message":"Resource not accessible"}`)) //nolint:errcheck // test handler write
+	})
+
+	c := testClient(t, mux)
+	pr, err := c.PullRequests.Create(context.Background(), "o", "r", &PullRequestCreate{
+		Title: "t", Head: "feature", Base: "main", Labels: []string{"steerspec-sync"},
+	})
+	if err == nil {
+		t.Fatal("expected the failed label request to be reported")
+	}
+	if pr == nil || pr.Number != 42 {
+		t.Errorf("the created PR must still be returned, got %+v", pr)
 	}
 }
 
@@ -1141,5 +1274,45 @@ func TestRepoListByTopicRejectsEmptyOrg(t *testing.T) {
 	}
 	if called {
 		t.Error("an unscoped search was issued despite the empty org")
+	}
+}
+
+// GitHub answers 404 "Branch  not found" when "branch" is present but empty,
+// rather than defaulting to the repository's default branch. Sending it anyway
+// is how deployment state went unwritten for months (GH #43).
+func TestCreateOrUpdateFileOmitsEmptyBranch(t *testing.T) {
+	tests := []struct {
+		name       string
+		branch     string
+		wantBranch bool
+	}{
+		{"empty branch is omitted", "", false},
+		{"real branch is sent", "steerspec-sync/claude-md/1.0.0", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var body map[string]any
+			mux := http.NewServeMux()
+			mux.HandleFunc("/repos/o/r/contents/f.txt", func(w http.ResponseWriter, r *http.Request) {
+				json.NewDecoder(r.Body).Decode(&body) //nolint:errcheck // test handler read
+				w.WriteHeader(http.StatusOK)
+				fmt.Fprint(w, `{}`) //nolint:errcheck // test handler write
+			})
+
+			c := testClient(t, mux)
+			err := c.Repos.CreateOrUpdateFile(context.Background(), "o", "r", "f.txt", tt.branch, []byte("x"), "", "msg")
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			got, present := body["branch"]
+			if present != tt.wantBranch {
+				t.Fatalf("branch key present = %v, want %v (body: %v)", present, tt.wantBranch, body)
+			}
+			if tt.wantBranch && got != tt.branch {
+				t.Errorf("branch = %v, want %q", got, tt.branch)
+			}
+		})
 	}
 }

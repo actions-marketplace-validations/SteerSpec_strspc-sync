@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -29,10 +30,14 @@ type AuthConfig struct {
 }
 
 type TemplateConfig struct {
-	ID          string            `yaml:"id"`
-	Version     string            `yaml:"version"`
-	Type        string            `yaml:"type"`
-	Source      string            `yaml:"source"`
+	ID      string `yaml:"id"`
+	Version string `yaml:"version"`
+	Type    string `yaml:"type"`
+	Source  string `yaml:"source"`
+	// Sources picks a source by target visibility (public, internal, private).
+	// A value is a path in the central repo or "owner/repo:path" in another
+	// repo; Source is the fallback for visibilities not listed.
+	Sources     map[string]string `yaml:"sources,omitempty"`
 	Destination string            `yaml:"destination"`
 	Strategy    string            `yaml:"strategy"`
 	Variables   map[string]string `yaml:"variables,omitempty"`
@@ -58,7 +63,23 @@ type SyncBehavior struct {
 	PRLabel       string `yaml:"pr-label,omitempty"`
 	CloseStalePRs *bool  `yaml:"close-stale-prs,omitempty"`
 	DryRun        bool   `yaml:"dry-run,omitempty"`
+	// CommitPrefix is what precedes ": update <template-id> to <version>" in
+	// the commit messages sync writes to target repos and to the central repo's
+	// deployment state. Defaults to DefaultCommitPrefix, a conventional-commit
+	// type and scope, so commitlint and semantic-PR checks accept sync commits.
+	CommitPrefix string `yaml:"commit-prefix,omitempty"`
+	// PRTitlePrefix is the same for SyncPullRequest titles. Defaults to
+	// DefaultPRTitlePrefix.
+	PRTitlePrefix string `yaml:"pr-title-prefix,omitempty"`
 }
+
+// DefaultCommitPrefix and DefaultPRTitlePrefix are the conventional-commit
+// type(scope) used for sync commits and PR titles when the config does not set
+// sync.commit-prefix or sync.pr-title-prefix.
+const (
+	DefaultCommitPrefix  = "chore(steerspec-sync)"
+	DefaultPRTitlePrefix = "chore(steerspec-sync)"
+)
 
 type MonitorBehavior struct {
 	Schedule   string `yaml:"schedule,omitempty"`
@@ -70,6 +91,9 @@ type ConflictBehavior struct {
 	Schedule   string `yaml:"schedule,omitempty"`
 	Tiers      []int  `yaml:"tiers,omitempty"`
 	IssueLabel string `yaml:"issue-label,omitempty"`
+	// AutoClose closes a conflict issue once the conflict it reported is gone
+	// (same semantics as monitor.auto-close). Defaults to true.
+	AutoClose *bool `yaml:"auto-close,omitempty"`
 }
 
 var (
@@ -77,8 +101,25 @@ var (
 	validTemplateTypes = map[string]bool{"claude-md": true, "skill": true, "agent": true, "config": true, "custom": true}
 	validStrategies    = map[string]bool{"mustache": true, "marker": true, "full-replace": true}
 	validConflictTiers = map[int]bool{1: true, 2: true, 3: true}
+	validVisibilities  = map[string]bool{"public": true, "internal": true, "private": true}
 	semverRE           = regexp.MustCompile(`^\d+\.\d+\.\d+$`)
+	sourceRepoRE       = regexp.MustCompile(`^([a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+):(.+)$`)
 )
+
+// ParseSource splits a template source into its repository ("owner/repo") and
+// path. A bare path has an empty repository and means the central repo.
+func ParseSource(src string) (repo, path string, err error) {
+	if src == "" {
+		return "", "", fmt.Errorf("source must not be empty")
+	}
+	if m := sourceRepoRE.FindStringSubmatch(src); m != nil {
+		return m[1], m[2], nil
+	}
+	if strings.Contains(src, ":") {
+		return "", "", fmt.Errorf("source %q must be a path or owner/repo:path", src)
+	}
+	return "", src, nil
+}
 
 func Load(path string) (*SyncConfig, error) {
 	data, err := os.ReadFile(path)
@@ -111,6 +152,12 @@ func ApplyDefaults(cfg *SyncConfig) {
 		t := true
 		cfg.Sync.CloseStalePRs = &t
 	}
+	if cfg.Sync.CommitPrefix == "" {
+		cfg.Sync.CommitPrefix = DefaultCommitPrefix
+	}
+	if cfg.Sync.PRTitlePrefix == "" {
+		cfg.Sync.PRTitlePrefix = DefaultPRTitlePrefix
+	}
 
 	if cfg.Monitor.Schedule == "" {
 		cfg.Monitor.Schedule = "0 8 * * 1"
@@ -132,6 +179,10 @@ func ApplyDefaults(cfg *SyncConfig) {
 	if cfg.Conflicts.IssueLabel == "" {
 		cfg.Conflicts.IssueLabel = "steerspec-conflict"
 	}
+	if cfg.Conflicts.AutoClose == nil {
+		t := true
+		cfg.Conflicts.AutoClose = &t
+	}
 }
 
 func Validate(cfg *SyncConfig) error {
@@ -152,6 +203,12 @@ func Validate(cfg *SyncConfig) error {
 		}
 	case "github-token":
 		// Token can be empty in config; resolved from GITHUB_TOKEN env var at runtime
+	}
+
+	for name, v := range map[string]string{"sync.commit-prefix": cfg.Sync.CommitPrefix, "sync.pr-title-prefix": cfg.Sync.PRTitlePrefix} {
+		if strings.ContainsAny(v, "\r\n") || strings.TrimSpace(v) != v {
+			return fmt.Errorf("%s %q must be a single line without surrounding whitespace", name, v)
+		}
 	}
 
 	if cfg.CentralRepo != "" {
@@ -179,6 +236,23 @@ func Validate(cfg *SyncConfig) error {
 		}
 		if !semverRE.MatchString(tmpl.Version) {
 			return fmt.Errorf("templates[%d].version %q must be a semver (e.g. \"1.0.0\")", i, tmpl.Version)
+		}
+
+		if tmpl.Source == "" && len(tmpl.Sources) == 0 {
+			return fmt.Errorf("templates[%d] needs source or sources", i)
+		}
+		if tmpl.Source != "" {
+			if _, _, err := ParseSource(tmpl.Source); err != nil {
+				return fmt.Errorf("templates[%d].source: %w", i, err)
+			}
+		}
+		for vis, src := range tmpl.Sources {
+			if !validVisibilities[vis] {
+				return fmt.Errorf("templates[%d].sources key %q must be one of: public, internal, private", i, vis)
+			}
+			if _, _, err := ParseSource(src); err != nil {
+				return fmt.Errorf("templates[%d].sources.%s: %w", i, vis, err)
+			}
 		}
 
 		if !validTemplateTypes[tmpl.Type] {

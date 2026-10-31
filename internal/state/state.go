@@ -20,6 +20,11 @@ type TemplateState struct {
 	Timestamp time.Time `json:"timestamp"`
 	PRNumber  int       `json:"pr_number,omitempty"`
 	PRStatus  string    `json:"pr_status,omitempty"`
+	// PreviousVersion is the version deployed before Version was proposed:
+	// the baseline a sync PR reports (SYNCPR-003). It survives forced re-runs
+	// of the same open PR, which would otherwise overwrite the baseline with
+	// the proposed version.
+	PreviousVersion string `json:"previous_version,omitempty"`
 }
 
 func NewDeploymentState() *DeploymentState {
@@ -38,6 +43,17 @@ func Load(data []byte) (*DeploymentState, error) {
 		ds.Repositories = make(map[string]map[string]TemplateState)
 	}
 	return &ds, nil
+}
+
+// Fingerprint identifies the recorded deployments. It ignores UpdatedAt, which
+// Save restamps on every call, so equal fingerprints mean nothing was recorded
+// in between.
+func (ds *DeploymentState) Fingerprint() (string, error) {
+	data, err := json.Marshal(ds.Repositories)
+	if err != nil {
+		return "", fmt.Errorf("fingerprinting state: %w", err)
+	}
+	return hash.HashBytes(data), nil
 }
 
 func (ds *DeploymentState) Save() ([]byte, error) {

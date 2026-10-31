@@ -25,7 +25,12 @@ func (s *pullRequestService) List(ctx context.Context, owner, repo string, opts 
 				params.Set("state", opts.State)
 			}
 			if opts.Head != "" {
-				params.Set("head", opts.Head)
+				// GitHub silently ignores a bare branch name and returns every PR.
+				head := opts.Head
+				if !strings.Contains(head, ":") {
+					head = owner + ":" + head
+				}
+				params.Set("head", head)
 			}
 		}
 
@@ -96,6 +101,10 @@ func (s *pullRequestService) Create(ctx context.Context, owner, repo string, pr 
 		labelsResp, err := s.client.doRequest(ctx, http.MethodPost, labelsURL, bytes.NewReader(labelsPayload))
 		if err != nil {
 			return created, err
+		}
+		// The PR lookup keys on this label, so an unlabeled PR is as good as lost.
+		if err := checkResponse(labelsResp); err != nil {
+			return created, fmt.Errorf("label PR %s/%s#%d: %w", owner, repo, created.Number, err)
 		}
 		labelsResp.Body.Close() //nolint:errcheck // label response body close is best-effort
 		created.Labels = pr.Labels
@@ -177,7 +186,9 @@ type apiPullRequest struct {
 	Labels []struct {
 		Name string `json:"name"`
 	} `json:"labels"`
-	HTMLURL string `json:"html_url"`
+	HTMLURL  string  `json:"html_url"`
+	Merged   bool    `json:"merged"`
+	MergedAt *string `json:"merged_at"`
 }
 
 func (p *apiPullRequest) toDomain() *PullRequest {
@@ -194,7 +205,27 @@ func (p *apiPullRequest) toDomain() *PullRequest {
 		Base:   p.Base.Ref,
 		Labels: labels,
 		URL:    p.HTMLURL,
+		// The list endpoint omits "merged" but carries merged_at; the single
+		// endpoint carries both.
+		Merged: p.Merged || p.MergedAt != nil,
 	}
+}
+
+// Get fetches a single pull request.
+func (s *pullRequestService) Get(ctx context.Context, owner, repo string, number int) (*PullRequest, error) {
+	u := fmt.Sprintf("%s/repos/%s/%s/pulls/%d", s.client.baseURL, url.PathEscape(owner), url.PathEscape(repo), number)
+	resp, err := s.client.doRequest(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil, err
+	}
+	if err := checkResponse(resp); err != nil {
+		return nil, fmt.Errorf("get pull request %s/%s#%d: %w", owner, repo, number, err)
+	}
+	var pr apiPullRequest
+	if err := decodeBody(resp, &pr); err != nil {
+		return nil, err
+	}
+	return pr.toDomain(), nil
 }
 
 func hasAllLabels(have, want []string) bool {

@@ -1,10 +1,13 @@
 package sync
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
+	"os"
 	"path"
 	"strings"
 	gosync "sync"
@@ -23,15 +26,20 @@ import (
 
 // Result represents the outcome of a sync operation.
 type Result struct {
-	ID           string       `json:"id"`
-	Trigger      string       `json:"trigger"`
-	Timestamp    time.Time    `json:"timestamp"`
-	Status       string       `json:"status"`
-	PRsCreated   int          `json:"prs_created"`
-	PRsUpdated   int          `json:"prs_updated"`
-	ReposSkipped int          `json:"repos_skipped"`
-	Errors       int          `json:"errors"`
-	RepoResults  []RepoResult `json:"repo_results"`
+	ID        string    `json:"id"`
+	Trigger   string    `json:"trigger"`
+	Timestamp time.Time `json:"timestamp"`
+	Status    string    `json:"status"`
+	// ReposTargeted is how many repositories the targets section resolved
+	// to after include, exclude, topics and the --target-filter. Zero means
+	// the token could not list the organization or nothing matched, which
+	// otherwise looks exactly like a run with nothing to do (GH #59).
+	ReposTargeted int          `json:"repos_targeted"`
+	PRsCreated    int          `json:"prs_created"`
+	PRsUpdated    int          `json:"prs_updated"`
+	ReposSkipped  int          `json:"repos_skipped"`
+	Errors        int          `json:"errors"`
+	RepoResults   []RepoResult `json:"repo_results"`
 }
 
 // RepoResult represents the outcome of syncing a single template to a single repo.
@@ -64,6 +72,9 @@ type Syncer struct {
 	stateMu      gosync.Mutex
 	state        *state.DeploymentState
 	stateSHA     string // SHA of the state file for updates
+	// stateLoaded fingerprints the state as read from the central repo. It is
+	// empty when no state was read, so a first run always writes (GH #100).
+	stateLoaded string
 }
 
 // repoListerAdapter adapts gh.RepoService to registry.RepoLister.
@@ -84,6 +95,7 @@ func (a *repoListerAdapter) ListByOrg(ctx context.Context, org string) ([]*regis
 			FullName:      r.FullName,
 			DefaultBranch: r.DefaultBranch,
 			Topics:        r.Topics,
+			Visibility:    r.Visibility,
 		})
 	}
 	return result, nil
@@ -102,6 +114,7 @@ func (a *repoListerAdapter) ListByTopic(ctx context.Context, topic, org string) 
 			FullName:      r.FullName,
 			DefaultBranch: r.DefaultBranch,
 			Topics:        r.Topics,
+			Visibility:    r.Visibility,
 		})
 	}
 	return result, nil
@@ -139,6 +152,18 @@ func (s *Syncer) Run(ctx context.Context, opts Options) (*Result, error) {
 	if opts.TargetFilter != "" {
 		targets = filterTargets(targets, opts.TargetFilter)
 	}
+	result.ReposTargeted = len(targets)
+	if len(targets) == 0 {
+		sslog.L().Warn("no target repositories resolved; check that the token can list the organization's repositories (a fine-grained PAT only sees the organization it was issued for) and that targets.include matches",
+			"operation", "sync", "include", s.cfg.Targets.Include, "target_filter", opts.TargetFilter)
+	} else {
+		names := make([]string, 0, len(targets))
+		for _, t := range targets {
+			names = append(names, t.Repo)
+		}
+		sslog.L().Info("resolved target repositories",
+			"operation", "sync", "count", len(targets), "repos", names)
+	}
 
 	// Load deployment state from central repo
 	s.state, s.stateSHA, err = s.loadState(ctx)
@@ -146,6 +171,9 @@ func (s *Syncer) Run(ctx context.Context, opts Options) (*Result, error) {
 		sslog.L().Warn("could not load deployment state, starting fresh",
 			"operation", "sync", "err", err)
 		s.state = state.NewDeploymentState()
+		s.stateLoaded = ""
+	} else if fp, ferr := s.state.Fingerprint(); ferr == nil {
+		s.stateLoaded = fp
 	}
 
 	// Filter templates
@@ -217,15 +245,49 @@ func (s *Syncer) Run(ctx context.Context, opts Options) (*Result, error) {
 		result.Status = "failed"
 	}
 
-	// Save state back (skip on dry run)
+	// Save state back (skip on dry run).
+	//
+	// A sync that cannot record its results has violated SYNCOP-008 ("MUST
+	// record results in the DeploymentState"), and every later run depends on
+	// that state: without it the hash check never skips, and monitor and
+	// conflict have nothing to compare against. This used to be logged at WARN
+	// and dropped, so runs reported errors:0 while writing nothing (GH #43).
 	if !dryRun {
 		if err := s.saveState(ctx); err != nil {
-			sslog.L().Warn("could not save deployment state",
+			sslog.L().Error("could not save deployment state",
 				"operation", "sync", "err", err)
+			result.Errors++
 		}
 	}
 
 	return result, nil
+}
+
+// templateSource locates a template's source file.
+type templateSource struct {
+	owner, repo, path string
+}
+
+// resolveSource picks the source for a target's visibility, falling back to
+// tmpl.Source. A bare path lives in the central repo; "owner/repo:path" names
+// another repository, so non-public text need not sit in a public central repo.
+func (s *Syncer) resolveSource(tmpl config.TemplateConfig, visibility string) (templateSource, error) {
+	raw := tmpl.Sources[visibility]
+	if raw == "" {
+		raw = tmpl.Source
+	}
+	if raw == "" {
+		return templateSource{}, fmt.Errorf("template %q has no source for %s targets", tmpl.ID, visibility)
+	}
+	fullName, srcPath, err := config.ParseSource(raw)
+	if err != nil {
+		return templateSource{}, err
+	}
+	if fullName == "" {
+		return templateSource{owner: s.centralOwner, repo: s.centralRepo, path: srcPath}, nil
+	}
+	owner, repo := splitRepo(fullName)
+	return templateSource{owner: owner, repo: repo, path: srcPath}, nil
 }
 
 func (s *Syncer) syncOne(ctx context.Context, target registry.ResolvedTarget, tmpl config.TemplateConfig, dryRun, force bool) RepoResult {
@@ -236,9 +298,15 @@ func (s *Syncer) syncOne(ctx context.Context, target registry.ResolvedTarget, tm
 
 	owner, repo := splitRepo(target.Repo)
 
-	// Read template source from central repo
-	// The template source is relative to the config repo
-	templateContent, _, err := s.ghClient.Repos.GetFileContent(ctx, s.centralOwner, s.centralRepo, tmpl.Source, "")
+	// Read the template source for this target's visibility; a bare path is
+	// relative to the central repo.
+	src, err := s.resolveSource(tmpl, target.Visibility)
+	if err != nil {
+		rr.Status = "error"
+		rr.Error = fmt.Sprintf("resolving template source: %v", err)
+		return rr
+	}
+	templateContent, _, err := s.ghClient.Repos.GetFileContent(ctx, src.owner, src.repo, src.path, "")
 	if err != nil {
 		rr.Status = "error"
 		rr.Error = fmt.Sprintf("reading template source: %v", err)
@@ -261,8 +329,33 @@ func (s *Syncer) syncOne(ctx context.Context, target registry.ResolvedTarget, tm
 	vars["repo_owner"] = owner
 	vars["repo_full_name"] = target.Repo
 
-	// Read existing file from target repo (may not exist)
-	existingContent, _, _ := s.ghClient.Repos.GetFileContent(ctx, owner, repo, tmpl.Destination, target.DefaultBranch)
+	// A symlink must be detected before the read: the Contents API follows a working link and returns the target
+	// as a regular file, so the content alone never shows it (GH #82).
+	isLink, err := s.ghClient.Repos.IsSymlink(ctx, owner, repo, tmpl.Destination, target.DefaultBranch)
+	if err != nil {
+		rr.Status = "error"
+		rr.Error = fmt.Sprintf("checking destination type: %v", err)
+		return rr
+	}
+	if isLink {
+		// Writing through the Contents API would store the rendered template as the
+		// symlink's target path, which git cannot check out.
+		sslog.L().Warn("destination is a symlink, skipping",
+			"operation", "sync", "template_id", tmpl.ID, "repo", target.Repo, "destination", tmpl.Destination)
+		rr.Status = "skipped"
+		rr.Error = fmt.Sprintf("destination %s is a symlink; point the template at the real file", tmpl.Destination)
+		return rr
+	}
+
+	// Read existing file from target repo. Only a 404 means it does not exist yet: after any other failure the
+	// marker strategy would see an empty file and render the bare template over the whole destination.
+	existingContent, _, err := s.ghClient.Repos.GetFileContent(ctx, owner, repo, tmpl.Destination, target.DefaultBranch)
+	destExists := err == nil
+	if err != nil && !isNotFound(err) {
+		rr.Status = "error"
+		rr.Error = fmt.Sprintf("reading existing %s: %v", tmpl.Destination, err)
+		return rr
+	}
 
 	// Render template
 	rendered, err := template.Render(template.Strategy(tmpl.Strategy), templateContent, existingContent, vars)
@@ -275,15 +368,41 @@ func (s *Syncer) syncOne(ctx context.Context, target registry.ResolvedTarget, tm
 	// Compute hash
 	contentHash := hash.HashBytes(rendered)
 
-	// Check state - skip if hash matches and not forced
-	if !force {
-		s.stateMu.Lock()
-		ts := s.state.GetTemplateState(target.Repo, tmpl.ID)
-		s.stateMu.Unlock()
-		if ts != nil && ts.Hash == contentHash {
-			rr.Status = "skipped"
-			return rr
+	// What the deployment state last recorded for this repo/template. Read
+	// before the force gate: the PR body reports the previous version
+	// (SYNCPR-003) whether or not --force skipped the hash comparison.
+	s.stateMu.Lock()
+	prev := s.state.GetTemplateState(target.Repo, tmpl.ID)
+	s.stateMu.Unlock()
+	previousVersion := baselineVersion(prev, tmpl.Version)
+
+	// The default branch already holds the rendered content: there is nothing to propose, whatever the state or
+	// --force say. Without this, a forced run opened empty PRs for content that was already merged (GH #94), and
+	// a closed PR was reported as "target not updated" although the file is current. A missing file never counts
+	// as current, even when the template renders to nothing.
+	if destExists && bytes.Equal(rendered, existingContent) {
+		rr.Status = "skipped"
+		if !dryRun {
+			// Bring the recorded PR status up to date first (GH #56), then the version and hash.
+			s.refreshPRStatus(ctx, owner, repo, target.Repo, tmpl.ID, prev)
+			s.recordInSync(target.Repo, tmpl, contentHash)
 		}
+		return rr
+	}
+
+	// Check state - skip if hash matches and not forced
+	if !force && prev != nil && prev.Hash == contentHash {
+		rr.Status = "skipped"
+		if s.refreshPRStatus(ctx, owner, repo, target.Repo, tmpl.ID, prev) == "closed" {
+			// The recorded PR was closed without merging, so the repo does not have this content. Retrying on
+			// every run would reopen a PR someone declined on purpose; say so and leave the retry to --force
+			// (GH #91).
+			rr.PRNumber = prev.PRNumber
+			rr.Error = fmt.Sprintf("sync PR #%d was closed without merging; run with force to open it again", prev.PRNumber)
+			sslog.L().Warn("sync PR closed without merging, target not updated",
+				"operation", "sync", "template_id", tmpl.ID, "repo", target.Repo, "pr_number", prev.PRNumber)
+		}
+		return rr
 	}
 
 	if dryRun {
@@ -318,7 +437,7 @@ func (s *Syncer) syncOne(ctx context.Context, target registry.ResolvedTarget, tm
 	_, fileSHA, _ := s.ghClient.Repos.GetFileContent(ctx, owner, repo, tmpl.Destination, branchName)
 
 	// Create or update file on branch
-	commitMsg := fmt.Sprintf("[SteerSpec] Update %s", tmpl.ID)
+	commitMsg := updateMessage(s.commitPrefix(), tmpl.ID, tmpl.Version)
 	err = s.ghClient.Repos.CreateOrUpdateFile(ctx, owner, repo, tmpl.Destination, branchName, rendered, fileSHA, commitMsg)
 	if err != nil {
 		rr.Status = "error"
@@ -326,21 +445,26 @@ func (s *Syncer) syncOne(ctx context.Context, target registry.ResolvedTarget, tm
 		return rr
 	}
 
-	// Find existing PR
+	// Find existing PR by its exact head branch. The label is not part of the
+	// lookup: a PR whose label request failed must still be found on a retry.
 	prLabel := s.cfg.Sync.PRLabel
 	existingPRs, _ := s.ghClient.PullRequests.List(ctx, owner, repo, &gh.PullRequestListOptions{
-		State:  "open",
-		Head:   branchName,
-		Labels: []string{prLabel},
+		State: "open",
+		Head:  owner + ":" + branchName,
 	})
 
-	prTitle := fmt.Sprintf("[SteerSpec] Update %s", tmpl.ID)
-	prBody := fmt.Sprintf("## SteerSpec Sync\n\n- **Template:** `%s`\n- **Version:** `%s`\n- **Hash:** `%s`\n\nThis PR was automatically generated by SteerSpec Sync.", tmpl.ID, tmpl.Version, contentHash)
+	prTitle := updateMessage(s.prTitlePrefix(), tmpl.ID, tmpl.Version)
+	prBody := s.prBody(tmpl, src, previousVersion, contentHash)
 
 	var pr *gh.PullRequest
-	if len(existingPRs) > 0 {
+	for _, existing := range existingPRs {
+		if existing.Head == branchName {
+			pr = existing
+			break
+		}
+	}
+	if pr != nil {
 		// Update existing PR
-		pr = existingPRs[0]
 		err = s.ghClient.PullRequests.Update(ctx, owner, repo, pr.Number, &gh.PullRequestUpdate{
 			Title: &prTitle,
 			Body:  &prBody,
@@ -362,10 +486,17 @@ func (s *Syncer) syncOne(ctx context.Context, target registry.ResolvedTarget, tm
 			Base:   target.DefaultBranch,
 			Labels: []string{prLabel},
 		})
-		if err != nil {
+		if err != nil && pr == nil {
 			rr.Status = "error"
 			rr.Error = fmt.Sprintf("creating PR: %v", err)
 			return rr
+		}
+		if err != nil {
+			// The PR exists but could not be labeled. Keep it so it is recorded in
+			// the deployment state instead of orphaned and re-created on the next run.
+			sslog.L().Warn("PR created but not labeled",
+				"operation", "sync", "template_id", tmpl.ID, "repo", target.Repo,
+				"pr_number", pr.Number, "error", err.Error())
 		}
 		rr.Status = "created"
 		rr.PRNumber = pr.Number
@@ -380,15 +511,67 @@ func (s *Syncer) syncOne(ctx context.Context, target registry.ResolvedTarget, tm
 	// Update deployment state
 	s.stateMu.Lock()
 	s.state.SetTemplateState(target.Repo, tmpl.ID, state.TemplateState{
-		Version:   tmpl.Version,
-		Hash:      contentHash,
-		Timestamp: time.Now(),
-		PRNumber:  pr.Number,
-		PRStatus:  "open",
+		Version:         tmpl.Version,
+		Hash:            contentHash,
+		Timestamp:       time.Now(),
+		PRNumber:        pr.Number,
+		PRStatus:        "open",
+		PreviousVersion: previousVersion,
 	})
 	s.stateMu.Unlock()
 
 	return rr
+}
+
+// refreshPRStatus brings a recorded pr_status up to date once the target is
+// in sync: the PR has usually been merged by then, but the state only ever
+// recorded "open" at creation time (GH #56). Only "merged" is terminal; an
+// unmerged "closed" PR can be reopened and merged later, so it is looked up
+// again. Best-effort: a lookup failure leaves the state as it was. It returns
+// the status the state holds afterwards.
+func (s *Syncer) refreshPRStatus(ctx context.Context, owner, repo, fullName, templateID string, prev *state.TemplateState) string {
+	if prev == nil || prev.PRNumber == 0 || prev.PRStatus == "merged" {
+		if prev == nil {
+			return ""
+		}
+		return prev.PRStatus
+	}
+	pr, err := s.ghClient.PullRequests.Get(ctx, owner, repo, prev.PRNumber)
+	if err != nil || pr == nil {
+		return prev.PRStatus
+	}
+	status := pr.State // "open" or "closed"
+	if pr.State == "closed" && pr.Merged {
+		status = "merged"
+	}
+	if status == prev.PRStatus {
+		return status
+	}
+	updated := *prev
+	updated.PRStatus = status
+	s.stateMu.Lock()
+	s.state.SetTemplateState(fullName, templateID, updated)
+	s.stateMu.Unlock()
+	sslog.L().Info("deployment state: pull request status updated",
+		"operation", "sync", "repo", fullName, "template_id", templateID, "pr", prev.PRNumber, "pr_status", status)
+	return status
+}
+
+// recordInSync records that the default branch already carries the rendered content, so the hash gate and the
+// monitor agree with the repository. A recorded PR number and status are kept: they describe a PR, not the file.
+func (s *Syncer) recordInSync(fullName string, tmpl config.TemplateConfig, contentHash string) {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	entry := state.TemplateState{Version: tmpl.Version, Hash: contentHash, Timestamp: time.Now()}
+	if cur := s.state.GetTemplateState(fullName, tmpl.ID); cur != nil {
+		if cur.Hash == contentHash && cur.Version == tmpl.Version {
+			return
+		}
+		entry.PRNumber = cur.PRNumber
+		entry.PRStatus = cur.PRStatus
+		entry.PreviousVersion = cur.PreviousVersion
+	}
+	s.state.SetTemplateState(fullName, tmpl.ID, entry)
 }
 
 func (s *Syncer) loadState(ctx context.Context) (*state.DeploymentState, string, error) {
@@ -401,11 +584,129 @@ func (s *Syncer) loadState(ctx context.Context) (*state.DeploymentState, string,
 }
 
 func (s *Syncer) saveState(ctx context.Context) error {
+	// Save restamps updated_at, so an unchanged state would still differ from
+	// the stored file and add a commit to the central repo on every run.
+	if s.stateLoaded != "" {
+		if fp, err := s.state.Fingerprint(); err == nil && fp == s.stateLoaded {
+			sslog.L().Debug("deployment state unchanged, not committing", "operation", "sync")
+			return nil
+		}
+	}
 	data, err := s.state.Save()
 	if err != nil {
 		return fmt.Errorf("serializing state: %w", err)
 	}
-	return s.ghClient.Repos.CreateOrUpdateFile(ctx, s.centralOwner, s.centralRepo, ".steerspec/deployment-state.json", "", data, s.stateSHA, "[SteerSpec] Update deployment state")
+	msg := s.commitPrefix() + ": update deployment state"
+	return s.ghClient.Repos.CreateOrUpdateFile(ctx, s.centralOwner, s.centralRepo, ".steerspec/deployment-state.json", "", data, s.stateSHA, msg)
+}
+
+// legacyTitlePrefix is the title prefix earlier releases generated
+// ("[SteerSpec] Update <template-id>"). closeStalePRs still recognises it so
+// PRs opened by an older release are closed when a newer version PR
+// supersedes them (SYNCPR-006).
+const legacyTitlePrefix = "[SteerSpec] Update "
+
+func (s *Syncer) commitPrefix() string {
+	if p := s.cfg.Sync.CommitPrefix; p != "" {
+		return p
+	}
+	return config.DefaultCommitPrefix
+}
+
+func (s *Syncer) prTitlePrefix() string {
+	if p := s.cfg.Sync.PRTitlePrefix; p != "" {
+		return p
+	}
+	return config.DefaultPRTitlePrefix
+}
+
+// updateMessage builds the conventional-commit subject shared by sync commits
+// and PR titles: "<prefix>: update <template-id> to <version>".
+func updateMessage(prefix, templateID, version string) string {
+	return fmt.Sprintf("%s: update %s to %s", prefix, templateID, version)
+}
+
+// isSyncPRForTemplate reports whether a PR title was generated for templateID,
+// in either the current format under prefix or the legacy "[SteerSpec] Update"
+// format. The current form matches up to and including " to " so that
+// "claude-md" does not claim PRs for "claude-md-extra".
+func isSyncPRForTemplate(title, prefix, templateID string) bool {
+	return strings.HasPrefix(title, prefix+": update "+templateID+" to ") ||
+		strings.HasPrefix(title, legacyTitlePrefix+templateID)
+}
+
+// serverURL is the web (not API) base of the GitHub instance, used for links
+// in PR bodies. Actions sets GITHUB_SERVER_URL; outside Actions github.com is
+// assumed.
+func serverURL() string {
+	if u := os.Getenv("GITHUB_SERVER_URL"); u != "" {
+		return strings.TrimRight(u, "/")
+	}
+	return "https://github.com"
+}
+
+// prBody renders the SyncPullRequest body. SYNCPR-003 requires the previous
+// version, the new version, a changelog and a diff link. Templates are not
+// tagged in the central repo, so the changelog is the template source's commit
+// history there and the diff link points at the source as rendered; the diff
+// of the rendered result is the PR itself.
+func (s *Syncer) prBody(tmpl config.TemplateConfig, src templateSource, previousVersion, contentHash string) string {
+	previous := "none (first deployment)"
+	if previousVersion != "" {
+		previous = fmt.Sprintf("%#q", previousVersion)
+	}
+	sourceRepo := fmt.Sprintf("%s/%s/%s", serverURL(), src.owner, src.repo)
+	sourcePath := escapePath(src.path)
+
+	var b strings.Builder
+	b.WriteString("## SteerSpec Sync\n\n")
+	fmt.Fprintf(&b, "Updates %#q from template %#q in [%s/%s](%s).\n\n",
+		tmpl.Destination, tmpl.ID, src.owner, src.repo, sourceRepo)
+	b.WriteString("| | |\n|---|---|\n")
+	fmt.Fprintf(&b, "| Previous version | %s |\n", previous)
+	fmt.Fprintf(&b, "| New version | %#q |\n", tmpl.Version)
+	fmt.Fprintf(&b, "| Content hash | %#q |\n\n", contentHash)
+	fmt.Fprintf(&b, "- **Changelog:** [commit history of %#q](%s/commits/HEAD/%s)\n", src.path, sourceRepo, sourcePath)
+	fmt.Fprintf(&b, "- **Diff:** [template source](%s/blob/HEAD/%s); the rendered change is this PR's **Files changed** tab\n\n",
+		sourceRepo, sourcePath)
+	b.WriteString("This PR was automatically generated by SteerSpec Sync. Edits to the managed file are overwritten ")
+	b.WriteString("by the next sync; drift is reported by `strspc monitor`.\n")
+	return b.String()
+}
+
+// baselineVersion is the version a sync PR reports as previous (SYNCPR-003).
+// State records the proposed version as soon as the PR is opened, so when the
+// state already holds tmpl.Version (a forced re-run of the same open PR) the
+// baseline is the one recorded with it, not the proposed version itself.
+func baselineVersion(prev *state.TemplateState, proposed string) string {
+	if prev == nil {
+		return ""
+	}
+	if prev.Version == proposed && prev.PreviousVersion != "" {
+		return prev.PreviousVersion
+	}
+	return prev.Version
+}
+
+// escapePath percent-encodes each segment of a repository path for use in a
+// URL, keeping the "/" separators: spaces, "#" and "?" in a template source
+// would otherwise break the Markdown link or be read as a fragment or query.
+func escapePath(p string) string {
+	segs := strings.Split(p, "/")
+	for i, seg := range segs {
+		segs[i] = url.PathEscape(seg)
+	}
+	return strings.Join(segs, "/")
+}
+
+// isSyncBranchForTemplate reports whether head is the branch of a sync PR for
+// templateID: "steerspec-sync/<template-id>/<version>", whatever title prefix
+// was configured when the PR was opened. Template IDs may contain "/", so the
+// remainder after the prefix must be exactly one version segment: "guide"
+// must not claim "steerspec-sync/guide/team/1.0.0" (template "guide/team").
+func isSyncBranchForTemplate(head, templateID string) bool {
+	rest, ok := strings.CutPrefix(head, "steerspec-sync/"+templateID+"/")
+	return ok && rest != "" && !strings.Contains(rest, "/")
 }
 
 // getBaseSHA resolves the branch a sync branch should be cut from to a commit
@@ -430,9 +731,14 @@ func (s *Syncer) closeStalePRs(ctx context.Context, owner, repo, templateID stri
 	if err != nil {
 		return
 	}
-	prefix := fmt.Sprintf("[SteerSpec] Update %s", templateID)
+	prefix := s.prTitlePrefix()
 	for _, pr := range prs {
-		if pr.Number != currentPR && strings.HasPrefix(pr.Title, prefix) {
+		if pr.Number == currentPR {
+			continue
+		}
+		// The head branch is stable across title-prefix changes; the title
+		// match keeps closing PRs whose branch was named by an older release.
+		if isSyncBranchForTemplate(pr.Head, templateID) || isSyncPRForTemplate(pr.Title, prefix, templateID) {
 			_ = s.ghClient.PullRequests.Close(ctx, owner, repo, pr.Number)
 		}
 	}
@@ -475,6 +781,12 @@ func shouldApplyTemplate(target registry.ResolvedTarget, templateID string) bool
 		}
 	}
 	return true
+}
+
+// isNotFound reports whether err is a GitHub API 404.
+func isNotFound(err error) bool {
+	var apiErr *gh.APIError
+	return errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusNotFound
 }
 
 // isAlreadyExists reports whether err is the GitHub API's "Reference already

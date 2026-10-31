@@ -11,8 +11,8 @@ jobs:
   action-smoke-test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
 
@@ -23,6 +23,12 @@ jobs:
 
       - name: Test version
         run: strspc version
+
+      - name: Action inputs declare and use token
+        run: tests/action-inputs_test.sh
+
+      - name: Action inputs cannot inject shell
+        run: tests/action-injection_test.sh
 
       - name: Test help
         run: strspc help

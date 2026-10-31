@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/SteerSpec/strspc-sync/internal/config"
+	sslog "github.com/SteerSpec/strspc-sync/internal/log"
 )
 
 // ResolvedRepo represents a repository resolved from the GitHub API.
@@ -17,6 +18,7 @@ type ResolvedRepo struct {
 	FullName      string // "owner/repo"
 	DefaultBranch string
 	Topics        []string
+	Visibility    string // "public", "internal" or "private"
 }
 
 // RepoLister is the interface needed from the GitHub client.
@@ -29,6 +31,7 @@ type RepoLister interface {
 type ResolvedTarget struct {
 	Repo             string
 	DefaultBranch    string
+	Visibility       string
 	Variables        map[string]string
 	ExcludeTemplates []string
 	IncludeTemplates []string
@@ -65,6 +68,8 @@ func (r *Registry) Resolve(ctx context.Context, targets config.TargetsConfig, gl
 		if err != nil {
 			return nil, fmt.Errorf("listing repos for org %q: %w", org, err)
 		}
+		sslog.L().Info("listed organization repositories",
+			"operation", "resolve", "org", org, "pattern", pattern, "discovered", len(repos))
 
 		for _, repo := range repos {
 			matched, err := path.Match(globPat, repo.Name)
@@ -144,6 +149,7 @@ func (r *Registry) Resolve(ctx context.Context, targets config.TargetsConfig, gl
 		rt := ResolvedTarget{
 			Repo:          repo.FullName,
 			DefaultBranch: repo.DefaultBranch,
+			Visibility:    repo.Visibility,
 			Variables:     vars,
 			Enabled:       true,
 		}
