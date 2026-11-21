@@ -48,7 +48,7 @@ jobs:
       # Read by the harness so in-test cleanup also leaves the run in place for debugging.
       E2E_KEEP: ${{ inputs.keep }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
         with:
           ref: ${{ inputs.ref }}
       - uses: actions/setup-go@v7
